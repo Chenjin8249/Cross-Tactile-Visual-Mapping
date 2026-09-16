@@ -12,17 +12,18 @@ import torch.nn as nn
 
 
 def read_txt(txt_path):
-    # Preserve original mean padding, but ensure odd deficits also reach 1601.
-    with open(txt_path, encoding="utf-8-sig") as stream:
-        values = [float(line.strip()) for line in stream if line.strip()]
-    ret = np.asarray(values, dtype=np.float32)
-    if not ret.size or not np.isfinite(ret).all():
-        raise ValueError(f"Empty or non-finite tactile data: {txt_path}")
-    deficit = 1601 - ret.size
-    if deficit < 0:
-        raise ValueError(f"{txt_path}: {ret.size} values; expected <=1601. Supply the original preprocessing; no silent truncation.")
-    return np.pad(ret, (deficit // 2, deficit - deficit // 2), mode="mean")
-
+    lines = []
+    with open(txt_path, 'r') as source_data:
+        for line in source_data.readlines():
+            lines.append(float(line.strip()))
+    ret = np.array(lines).astype(np.float32)
+    # print(ret.shape, len(ret))
+    # exit()
+    if len(ret) == 0 or len(ret) > 1601 or not np.isfinite(ret).all():
+        raise ValueError(f'Expected 1 to 1601 finite values: {txt_path}')
+    padding = 1601 - len(ret)
+    return np.pad(ret, (padding // 2, padding - padding // 2), 'mean')
+#     return ret
 
 def label_fun(label_path):
     print(label_path)
@@ -52,8 +53,6 @@ class Datasets(Dataset):
         assert len(self.source_files_paths) == len(self.target_files_paths), \
             f'{len(self.source_files_paths)} != {len(self.target_files_paths)}'
 
-        if not self.source_files_paths:
-            raise ValueError(f"No paired samples in {data_dir}")
         self.transform = transforms.Compose(
             [transforms.ToTensor(),
              transforms.Resize((256, 256))
@@ -67,8 +66,7 @@ class Datasets(Dataset):
 
         source = read_txt(source_file)
         # source = read_npy_file(source_file)
-        with Image.open(target_file) as image:
-            target = image.convert("L")
+        target = Image.open(target_file).convert("L")
         # label = label_fun(label_file)
         # print(target.size, source.shape,label)
 

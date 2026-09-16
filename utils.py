@@ -23,7 +23,6 @@ from pytorch_msssim import ms_ssim
 from typing import Tuple, Union
 import numpy as np
 import torch.optim as optim
-from losses import Loss, compute_joint, crossview_contrastive_Loss
 
 
 def parse_args():
@@ -37,7 +36,7 @@ def parse_args():
     )
     parser.add_argument(
         "--metrics",
-        default='ccl', choices=['ccl'],
+        default='ccl',  # mse / ms-ssim
         type=str,
         help="Number of epochs (default: %(default)s)",
     )
@@ -73,7 +72,7 @@ def parse_args():
         default=4,
         help="Dataloaders threads (default: %(default)s)",
     )
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size (default: %(default)s)")  # 8
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size (default: %(default)s)")  # 8
     parser.add_argument(
         "--test-batch-size",
         type=int,
@@ -88,7 +87,6 @@ def parse_args():
         type=float,
         help="gradient clipping max norm (default: %(default)s",
     )
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda or cuda:0")
     args = parser.parse_args()
     return args
 
@@ -98,6 +96,75 @@ def save_checkpoint(state, is_best, filename):
     if is_best:
         torch.save(state, filename.replace('checkpoint', 'checkpoint_best_loss'))
 
+
+def compute_joint(view1, view2):
+    """Compute the joint probability matrix P"""
+
+    bn, k = view1.size()
+    assert (view2.size(0) == bn and view2.size(1) == k)
+
+    view1 = F.softmax(view1, dim=1)
+    view2 = F.softmax(view2, dim=1)
+    p_i_j = view1.unsqueeze(2) * view2.unsqueeze(1)
+    p_i_j = p_i_j.sum(dim=0)
+    p_i_j = (p_i_j + p_i_j.t()) / 2.  # symmetrise
+    p_i_j = p_i_j.clamp_min(torch.finfo(p_i_j.dtype).eps)
+    p_i_j = p_i_j / p_i_j.sum()  # normalise
+
+    return p_i_j
+
+
+# def crossview_contrastive_Loss(view1, view2, lamb=9, EPS=sys.float_info.epsilon):
+#     """Contrastive loss for maximizng the consistency"""
+#     n, k = view1.size()
+#     p_i_j = compute_joint(view1, view2)
+#     assert (p_i_j.size() == (k, k))
+#
+#     p_i = p_i_j.sum(dim=1).view(k, 1).expand(k, k)
+#     p_j = p_i_j.sum(dim=0).view(1, k).expand(k, k)
+#
+#     #     Works with pytorch <= 1.2
+#     #     p_i_j[(p_i_j < EPS).data] = EPS
+#     #     p_j[(p_j < EPS).data] = EPS
+#     #     p_i[(p_i < EPS).data] = EPS
+#
+#     # Works with pytorch > 1.2
+#     p_i_j = torch.where(p_i_j < EPS, torch.tensor([EPS], device=p_i_j.device), p_i_j)
+#     p_j = torch.where(p_j < EPS, torch.tensor([EPS], device=p_j.device), p_j)
+#     p_i = torch.where(p_i < EPS, torch.tensor([EPS], device=p_i.device), p_i)
+#
+#
+#     loss = - 3 * p_i_j * torch.log(p_i_j) + 2 * p_i * torch.log(p_i) + 2 * p_j * torch.log(p_j)
+#
+#     loss = loss.sum()/(k*k)
+#
+#     return loss
+def crossview_contrastive_Loss(view1, view2, lamb=9.0, EPS=sys.float_info.epsilon):
+    """Contrastive loss for maximizng the consistency"""
+    _, k = view1.size()
+    p_i_j = compute_joint(view1, view2)
+    assert (p_i_j.size() == (k, k))
+
+    p_i = p_i_j.sum(dim=1).view(k, 1).expand(k, k)
+    p_j = p_i_j.sum(dim=0).view(1, k).expand(k, k)
+
+    #     Works with pytorch <= 1.2
+    #     p_i_j[(p_i_j < EPS).data] = EPS
+    #     p_j[(p_j < EPS).data] = EPS
+    #     p_i[(p_i < EPS).data] = EPS
+
+    # Works with pytorch > 1.2
+    p_i_j = torch.where(p_i_j < EPS, torch.tensor([EPS], device=p_i_j.device), p_i_j)
+    p_j = torch.where(p_j < EPS, torch.tensor([EPS], device=p_j.device), p_j)
+    p_i = torch.where(p_i < EPS, torch.tensor([EPS], device=p_i.device), p_i)
+
+    loss = - p_i_j * (torch.log(p_i_j) \
+                      - (lamb + 1) * torch.log(p_j) \
+                      - (lamb + 1) * torch.log(p_i))
+
+    loss = loss.sum()/(k*k)
+
+    return loss
 
 def compute_metrics(
         a: Union[np.array, Image.Image],
@@ -118,9 +185,42 @@ def compute_metrics(
         b = b.permute(0, 3, 1, 2)
 
     mse = torch.mean((a - b) ** 2).item()
-    p = float("inf") if mse == 0 else 20 * np.log10(max_val) - 10 * np.log10(mse)
+    p = 20 * np.log10(max_val) - 10 * np.log10(mse)
     m = ms_ssim(a, b, data_range=max_val).item()
     return p, m
+
+
+class Loss(nn.Module):
+
+    def __init__(self, metrics='ccl'):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.metrics = metrics
+
+    def forward(self, SourceLatent, TargetLatent, SourcePredict, TargetPredict, source, target):
+        out = {}
+
+        out["mse_loss_T"] = self.mse(TargetPredict, target)
+        out["mse_loss_S"] = self.mse(SourcePredict, source)
+        out["ms_ssim_loss"] = 1 - ms_ssim(TargetPredict, target, data_range=1.0)
+        out["crossview_contrastive_Loss"] = crossview_contrastive_Loss(SourceLatent.view(SourceLatent.shape[0], -1), TargetLatent.view(TargetLatent.shape[0], -1))
+        out["loss"] = 0.2 * out["crossview_contrastive_Loss"] + 0.4 * out["mse_loss_T"] + 0.4 * out["mse_loss_S"]
+        # out["loss"] =out["mse_loss_S"]
+        # out["loss"] =  0.5 * out["ms_ssim_loss"]
+        # if self.metrics == 'mse':
+        #     out["mse_loss"] = self.mse(TargetPredict, target)
+        #     out["ms_ssim_loss"] = None
+        #     out["loss"] = out["mse_loss"]
+        # elif self.metrics == 'ms-ssim':
+        #     out["mse_loss"] = self.mse(TargetPredict, target)
+        #     out["ms_ssim_loss"] = 1 - ms_ssim(TargetPredict, target, data_range=1.0)
+        #     out["loss"] = out["ms_ssim_loss"]
+        # elif self.metrics == 'cl':
+        #     out["mse_loss"] = self.mse(SourcePredict, target)
+        #     out["ms_ssim_loss"] = 1 - ms_ssim(TargetPredict, target, data_range=1.0)
+        #     out["crossview_contrastive_Loss"] = crossview_contrastive_Loss(SourceLatent, TargetLatent)
+        #     out["loss"] = 0.5*out["crossview_contrastive_Loss"] + 0.5*out["ms_ssim_loss"]
+        return out
 
 
 def configure_optimizers(net, args):

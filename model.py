@@ -124,10 +124,6 @@ class Model(nn.Module):
 
     def forward(self, ha, vi):
 
-        if ha.ndim != 2 or ha.shape[1] != 1601:
-            raise ValueError(f"Expected tactile [B,1601], got {tuple(ha.shape)}")
-        if vi.ndim != 4 or tuple(vi.shape[1:]) != (1, 256, 256) or vi.shape[0] != ha.shape[0]:
-            raise ValueError(f"Expected images [B,1,256,256], got {tuple(vi.shape)}")
         # ha in
         h = self.net1(ha)
         h0 = h.reshape([h.shape[0]] + [1, 256, 256])

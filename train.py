@@ -1,5 +1,5 @@
 import os
-# Select devices with --device; preserve the caller's CUDA visibility.
+os.environ['CUDA_VISIBLE_DEVICES'] = str(0)
 from glob import glob
 import shutil
 import math
@@ -23,7 +23,7 @@ from model import Model
 from datasets import Datasets
 # from CompleterModel import *
 from utils import *
-
+torch.cuda.empty_cache()
 
 def train_one_epoch(model, criterion, train_dataloader, optimizer, epoch, clip_max_norm,
                     logger_train, tb_logger, current_step, args):
@@ -56,7 +56,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, epoch, clip_m
         optimizer.step()
 
         psrn = -10 * np.log10(max(out_criterion["mse_loss_T"].item(), 1e-12))
-        msssim = 1 - out_criterion["ms_ssim_loss"]
+        msssim = ms_ssim(target, TargetPredict, data_range=1.0)
         # ccl = crossview_contrastive_Loss(SourceLatent, TargetLatent)
 
         train_loss.update(out_criterion["loss"].item(), target.size(0))
@@ -68,7 +68,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, epoch, clip_m
 
         current_step += 1
         if current_step % 100 == 0:
-            tb_logger.add_scalar('[train]: loss', out_criterion["loss"].item(), current_step)
+            # tb_logger.add_scalar('{}'.format('[train]: loss'), out_criterion["loss"].item(), current_step)
             # if out_criterion["mse_loss"] is not None:
             #     tb_logger.add_scalar('{}'.format('[train]: mse_loss'), out_criterion["mse_loss"].item(), current_step)
             if out_criterion["ms_ssim_loss"] is not None:
@@ -88,7 +88,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, epoch, clip_m
             # marker = 'ccl' if out_criterion["ms_ssim_loss"] else 'MS-SSIM'
             print(
                 f"Train epoch {epoch}: ["
-                f"{i * train_dataloader.batch_size:5d}/{len(train_dataloader.dataset)}"
+                f"{i * len(d):5d}/{len(train_dataloader.dataset)}"
                 f" ({100. * i / len(train_dataloader):.0f}%)] "
                 f'Loss: {out_criterion["loss"].item():.3f} | '
                 f'mseT loss: {out_criterion["mse_loss_T"].item():.3f} | '
@@ -113,48 +113,95 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, epoch, clip_m
 def test_epoch(epoch, test_dataloader, model, criterion, save_dir, logger_val, tb_logger):
     model.eval()
     device = next(model.parameters()).device
-    keys = ["loss", "mse_loss_S", "mse_loss_T", "crossview_contrastive_Loss", "ms_ssim_loss"]
-    meters = {key: AverageMeter() for key in keys}
-    psnr, similarity = AverageMeter(), AverageMeter()
+
+    loss = AverageMeter()
+    # mse_loss = AverageMeter()
+    ms_ssim_loss = AverageMeter()
+    psnr = AverageMeter()
+    ms_ssim = AverageMeter()
+    CCL = AverageMeter()
+    mse_T = AverageMeter()
+    mse_S = AverageMeter()
+
     with torch.no_grad():
-        for i, (source, target) in enumerate(test_dataloader):
-            source, target = source.to(device).float(), target.to(device)
-            z_source, z_target, predicted_source, predicted_target = model(source, target)
-            out = criterion(z_source, z_target, predicted_source, predicted_target, source, target)
-            for key in keys:
-                meters[key].update(out[key].item(), source.size(0))
-            # Per-image, clipped and uint8-quantized metrics, matching legacy validation.
-            for predicted, expected in zip(predicted_target, target):
-                p, m = compute_metrics(torch2img(predicted), torch2img(expected))
+        for i, d in enumerate(test_dataloader):
+            source = d[0].to(device).float()
+            target = d[1].to(device)
+
+            SourceLatent, TargetLatent, SourcePredict, TargetPredict = model(source, target)
+            out_criterion = criterion(SourceLatent, TargetLatent, SourcePredict, TargetPredict, source, target)
+
+            loss.update(out_criterion["loss"])
+            # if out_criterion["mse_loss"] is not None:
+            #     mse_loss.update(out_criterion["mse_loss"])
+            if out_criterion["ms_ssim_loss"] is not None:
+                ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+            if out_criterion["mse_loss_T"] is not None:
+                mse_T.update(out_criterion["mse_loss_T"])
+            if out_criterion["mse_loss_S"] is not None:
+                mse_S.update(out_criterion["mse_loss_S"])
+            if out_criterion["crossview_contrastive_Loss"] is not None:
+                CCL.update(out_criterion["crossview_contrastive_Loss"])
+
+            for prediction, ground_truth in zip(TargetPredict, target):
+                rec = torch2img(prediction)
+                img = torch2img(ground_truth)
+                p, m = compute_metrics(rec, img)
                 psnr.update(p)
-                similarity.update(m)
+                ms_ssim.update(m)
+
             if (epoch + 1) % 20 == 0:
-                from torchvision.utils import save_image
-                os.makedirs(save_dir, exist_ok=True)
-                save_image(predicted_target, os.path.join(save_dir, f"TargetPre_{i:03d}.png"))
-                for name, value in [("SourcePre", predicted_source), ("SourceLat", z_source), ("TargetLat", z_target)]:
-                    values = value.reshape(-1, value.size(-1)).detach().cpu().numpy()
-                    np.savetxt(os.path.join(save_dir, f"{name}_{i:03d}.txt"), values)
-    if meters["loss"].count == 0:
-        raise ValueError("Validation loader is empty")
-    for key, meter in meters.items():
-        tb_logger.add_scalar(f"[val]: {key}", meter.avg, epoch + 1)
-    tb_logger.add_scalar("[val]: psnr", psnr.avg, epoch + 1)
-    tb_logger.add_scalar("[val]: ms-ssim", similarity.avg, epoch + 1)
-    logger_val.info("Validation epoch %d: loss %.6f | tactile MSE %.6f | visual MSE %.6f | CCL %.6f | PSNR %.6f | MS-SSIM %.6f",
-                    epoch, meters["loss"].avg, meters["mse_loss_S"].avg, meters["mse_loss_T"].avg,
-                    meters["crossview_contrastive_Loss"].avg, psnr.avg, similarity.avg)
-    return float(meters["loss"].avg), float(psnr.avg)
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                if (i + 1) % 10 == 0 or 1:
+                    from torchvision.utils import save_image
+                    save_image(torch.cat([TargetPredict]), os.path.join(save_dir, 'TargetPre_%03d.png' % i))
+                    np.savetxt(os.path.join(save_dir, 'SourcePre%03d.txt' % i), SourcePredict.reshape(-1, SourcePredict.size(-1)).detach().cpu().numpy())
+                    np.savetxt(os.path.join(save_dir, 'SourceLat_%03d.txt' % i), SourceLatent.reshape(-1, SourceLatent.size(-1)).detach().cpu().numpy())
+                    np.savetxt(os.path.join(save_dir, 'TargetLat_%03d.txt' % i), TargetLatent.reshape(-1, TargetLatent.size(-1)).detach().cpu().numpy())
+            # np.savetxt(os.path.join(save_dir, 'Sourceepoch_%03d.txt' % i), SourceLatent.view(-1, SourceLatent.size(-1)).cpu().numpy())
+            # np.savetxt(os.path.join(save_dir, 'Targetepoch_%03d.txt' % i), TargetLatent.view(-1, SourceLatent.size(-1)).cpu().numpy())
+
+
+    tb_logger.add_scalar('{}'.format('[val]: loss'), loss.avg, epoch + 1)
+    tb_logger.add_scalar('{}'.format('[val]: psnr'), psnr.avg, epoch + 1)
+    tb_logger.add_scalar('{}'.format('[val]: ms-ssim'), ms_ssim.avg, epoch + 1)
+    tb_logger.add_scalar('{}'.format('[val]: CCL'), CCL.avg, epoch + 1)
+    tb_logger.add_scalar('{}'.format('[val]: mse_T'), mse_T.avg, epoch + 1)
+    tb_logger.add_scalar('{}'.format('[val]: mse_S'), mse_S.avg, epoch + 1)
+
+    logger_val.info(
+        f"Test epoch {epoch}: Average losses: "
+        f"Loss: {loss.avg:.4f} | "
+        f"PSNR: {psnr.avg:.6f} | "
+        f"MS-SSIM: {ms_ssim.avg:.6f} |"
+        f"CCL: {CCL.avg:.6f} |"
+        f'mseT loss: {mse_T.avg:.6f} | '
+        f'mseS loss: {mse_S.avg:.6f} | '
+    )
+
+    # if out_criterion["mse_loss"] is not None:
+    #     tb_logger.add_scalar('{}'.format('[val]: mse_loss'), mse_loss.avg, epoch + 1)
+    if out_criterion["ms_ssim_loss"] is not None:
+        tb_logger.add_scalar('{}'.format('[val]: ms_ssim_loss'), ms_ssim_loss.avg, epoch + 1)
+    if out_criterion["mse_loss_T"] is not None:
+        tb_logger.add_scalar('{}'.format('[train]: mse_loss_T'), mse_T.avg, epoch + 1)
+    if out_criterion["mse_loss_S"] is not None:
+        tb_logger.add_scalar('{}'.format('[train]: mse_loss_S'), mse_S.avg, epoch + 1)
+    if out_criterion["crossview_contrastive_Loss"] is not None:
+        tb_logger.add_scalar('{}'.format('[train]: crossview_contrastive_Loss'),
+                             CCL.avg, epoch + 1)
+
+    return loss.avg, psnr.avg
 
 
 def main():
+    device = "cuda"
     args = parse_args()
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
-        np.random.seed(args.seed)
 
     date = str(datetime.datetime.now())
     date = date[:date.rfind(".")].replace("-", "").replace(":", "").replace(" ", "_")
@@ -230,22 +277,20 @@ def main():
     criterion = Loss(metrics=args.metrics)
 
     if args.checkpoint != '':
-        logger.info('Loading %s', args.checkpoint)
+        logger.info("Loading %s", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        if checkpoint.get("revision") != "unet_bidirectional_v2":
-            raise ValueError("Legacy checkpoints are not resumable with the new head/Adam objective. Start a new run.")
         net.load_state_dict(checkpoint["state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         start_epoch = checkpoint['epoch'] + 1
         best_loss = checkpoint['loss']
-        current_step = checkpoint["global_step"]
-        best_psnr = checkpoint["best_psnr"]
+        current_step = start_epoch * math.ceil(len(train_dataloader.dataset) / args.batch_size)
     else:
         start_epoch = 0
         best_loss = 1e10
         current_step = 0
-        best_psnr = -float("inf")
+
+    best_psnr = checkpoint.get("best_psnr", -float("inf")) if args.checkpoint else -float("inf")
     for epoch in range(start_epoch, args.epochs):
         logger.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
         current_step = train_one_epoch(
@@ -269,10 +314,8 @@ def main():
         best_psnr = max(best_psnr, psnr)
         best_loss = min(loss, best_loss)
         state = {
-                "revision": "unet_bidirectional_v2",
-                "global_step": current_step,
-                "best_psnr": best_psnr,
                 "epoch": epoch,
+                "best_psnr": best_psnr,
                 "state_dict": net.state_dict(),
                 "loss": loss,
                 "optimizer": optimizer.state_dict(),
@@ -281,8 +324,6 @@ def main():
         torch.save(state, os.path.join(log_dir, f"latest.pth"))
         if is_best:
             torch.save(state, os.path.join(log_dir, f"best.pth"))
-
-    tb_logger.close()
 
 
 if __name__ == "__main__":
