@@ -48,7 +48,7 @@ data/
     Target/*.jpg
 ```
 
-Each tactile file stores one scalar per line. The model uses 1601-point tactile inputs; shorter signals are padded to this length. Material images are converted to grayscale and resized to 256 × 256. Source and target files are paired in sorted filename order.
+Each tactile file stores one scalar per line. Material images are converted to grayscale and resized to 256 × 256. Source and target files are paired in sorted filename order.
 
 ## Training
 
