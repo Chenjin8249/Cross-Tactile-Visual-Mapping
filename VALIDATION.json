@@ -1,0 +1,22 @@
+{
+  "syntax_files_passed": 7,
+  "reader_tests": {
+    "pad_1": "PASS",
+    "pad_1580": "PASS",
+    "pad_1581": "PASS",
+    "pad_1600": "PASS",
+    "pad_1601": "PASS",
+    "empty": "PASS: rejected",
+    "nan": "PASS: rejected",
+    "too_long": "PASS: rejected"
+  },
+  "both_decoder_final_calls": "PASS: one A_final and one B_final",
+  "criterion_interface": "PASS: train and validation pass 6 arguments",
+  "runtime_selftests": {
+    "provided": 4,
+    "executed": 0,
+    "reason": "PyTorch unavailable; previous installation downloads timed out"
+  },
+  "paper_metrics": "NOT REPRODUCED",
+  "data_pairing_and_1601_preprocessing": "Not verified: no paired dataset provided"
+}
