@@ -25,7 +25,6 @@ The generated visual representations enable the use of computer vision methods f
 | `test.py` | Auxiliary classification evaluation script. |
 | `CompleterModel.py` | Auxiliary multi-view representation model from COMPLETER. |
 | `ChangeFilename.py` | Dataset filename processing utility. |
-| `tool.py` | Signal visualization utility. |
 
 ## Environment
 
